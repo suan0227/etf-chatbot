@@ -1,0 +1,8 @@
+.env
+etf/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/
+vectorstore/

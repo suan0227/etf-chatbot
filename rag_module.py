@@ -1,9 +1,9 @@
 """ETF FAQ RAG와 금융위원회 ETF 시세 OpenAPI 모듈."""
 from __future__ import annotations
 
-import hashlib, json, os, re, tempfile
+import hashlib, os, re, shutil, tempfile
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import unquote
@@ -20,7 +20,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 load_dotenv()
 ETF_API_URL = "https://apis.data.go.kr/1160100/service/GetSecuritiesProductInfoService/getETFPriceInfo"
 ETF_API_SOURCE = "금융위원회 증권상품시세정보 OpenAPI"
+BREVITY_WORDS = ("간단", "쉽게", "한 줄", "한줄", "요약", "뭐라는")
 CHAT_MODEL, EMBEDDING_MODEL = "gemini-3.5-flash", "models/gemini-embedding-001"
+RAG_MIN_RELEVANCE_SCORE, MAX_CACHED_INDEXES = 0.5, 2
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_FAQ_PATH = BASE_DIR / "data" / "ETF_FAQ.pdf"
 VECTORSTORE_DIR = BASE_DIR / "vectorstore"
@@ -37,8 +39,11 @@ class GeminiError(RAGError): pass
 
 NUMERIC_FIELDS = {"clpr", "vs", "fltRt", "nav", "mkp", "hipr", "lopr", "trqu", "trPrc", "mrktTotAmt", "nPptTotAmt", "stLstgCnt", "bssIdxClpr"}
 ALL_FIELDS = ["basDt", "srtnCd", "isinCd", "itmsNm", "clpr", "vs", "fltRt", "nav", "mkp", "hipr", "lopr", "trqu", "trPrc", "mrktTotAmt", "nPptTotAmt", "stLstgCnt", "bssIdxIdxNm", "bssIdxClpr"]
-FIELD_LABELS = {"clpr":"종가", "nav":"NAV", "mkp":"시가", "hipr":"고가", "lopr":"저가", "trqu":"거래량", "trPrc":"거래대금", "mrktTotAmt":"시가총액", "nPptTotAmt":"순자산총액", "fltRt":"등락률", "bssIdxIdxNm":"기초지수명", "bssIdxClpr":"기초지수 종가"}
-METRIC_WORDS = {"종가":"clpr", "가격":"clpr", "NAV":"nav", "순자산가치":"nav", "시가":"mkp", "고가":"hipr", "저가":"lopr", "거래량":"trqu", "거래대금":"trPrc", "시가총액":"mrktTotAmt", "순자산총액":"nPptTotAmt", "등락률":"fltRt", "기초지수":"bssIdxIdxNm"}
+ETF_BRANDS = ("KODEX", "TIGER", "ACE", "RISE", "SOL", "PLUS", "HANARO")
+ETF_BRAND_PATTERN = "|".join(ETF_BRANDS)
+ETF_CODE_PATTERN = r"(?<![A-Za-z0-9])([0-9][A-Za-z0-9]{5})(?![A-Za-z0-9])"
+QUERY_FILLER_WORDS = ("순자산가치", "NAV", "종가", "가격", "괴리율", "분석")
+RAG_CONCEPT_WORDS = ("NAV", "순자산가치", "괴리율", "추적오차", "시장가격", "기준가격", "유동성공급자", "LP", "할증", "할인", "프리미엄")
 
 def _key(name: str, fallback: str | None = None) -> str | None:
     return os.getenv(name) or (os.getenv(fallback) if fallback else None)
@@ -65,8 +70,10 @@ def _friendly_gemini_error(exc: Exception) -> GeminiError:
     return GeminiError("Gemini 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
 
 def normalize_etf_query(text: str) -> str:
-    for old, new in {"코덱스":"KODEX", "타이거":"TIGER", "에이스":"ACE", "케이비스타":"KBSTAR", "쏠":"SOL"}.items():
+    for old, new in {"코덱스":"KODEX", "타이거":"TIGER", "에이스":"ACE", "케이비스타":"RISE", "라이즈":"RISE", "쏠":"SOL", "아리랑":"PLUS", "플러스":"PLUS", "하나로":"HANARO"}.items():
         text = re.sub(old, new, text, flags=re.I)
+    text = re.sub(r"\bKBSTAR\b", "RISE", text, flags=re.I)
+    text = re.sub(r"\bARIRANG\b", "PLUS", text, flags=re.I)
     return text.strip()
 
 def _canonical_etf_name(text: Any) -> str:
@@ -92,6 +99,19 @@ def resolve_faq_pdf_path() -> Path:
     if len(pdfs) == 1: return pdfs[0]
     if not pdfs: raise ConfigurationError("등록된 ETF FAQ PDF를 찾지 못했습니다. data 폴더 또는 FAQ_PDF_PATH를 확인해 주세요.")
     raise ConfigurationError("data 폴더에 PDF가 여러 개 있어 FAQ 문서를 결정할 수 없습니다. FAQ_PDF_PATH를 설정해 주세요.")
+
+def cleanup_old_indexes(current_digest: str, max_indexes: int = MAX_CACHED_INDEXES, root: Path | None = None) -> list[Path]:
+    """현재 인덱스와 최근 인덱스만 남기고 이전 해시 인덱스를 정리한다."""
+    if max_indexes < 1: raise ValueError("max_indexes는 1 이상이어야 합니다.")
+    store = root or VECTORSTORE_DIR
+    if not store.is_dir(): return []
+    index_dirs = [path for path in store.iterdir() if path.is_dir() and re.fullmatch(r"[0-9a-f]{64}", path.name)]
+    current = store / current_digest
+    others = sorted((path for path in index_dirs if path != current), key=lambda path:path.stat().st_mtime, reverse=True)
+    ordered = ([current] if current in index_dirs else []) + others
+    deleted = ordered[max_indexes:]
+    for path in deleted: shutil.rmtree(path)
+    return deleted
 
 class ETFAPIClient:
     allowed_params = {"basDt", "beginBasDt", "endBasDt", "likeSrtnCd", "isinCd", "itmsNm", "likeItmsNm", "likeBssIdxIdxNm", "beginTrqu", "endTrqu", "beginMrktTotAmt", "endMrktTotAmt", "beginNav", "endNav"}
@@ -149,8 +169,8 @@ class ETFAPIClient:
         return {f: (_number(item.get(f)) if f in NUMERIC_FIELDS else item.get(f) or None) for f in ALL_FIELDS}
 
     def search_etfs(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        query = normalize_etf_query(query); code = re.search(r"(?<!\d)(\d{6})(?!\d)", query)
-        if code: rows = self._request(likeSrtnCd=code.group(1))
+        query = normalize_etf_query(query); code = re.search(ETF_CODE_PATTERN, query, re.I)
+        if code: rows = self._request(likeSrtnCd=code.group(1).upper())
         else:
             cleaned = re.sub(r"(?:최근|알려줘|찾아줘|가격|종가|거래량|거래대금|시가총액|NAV|ETF|추종하는)", " ", query, flags=re.I).strip()
             rows = self._request(likeItmsNm=cleaned)
@@ -176,8 +196,9 @@ class ETFAPIClient:
         return self._request(num_rows=1000, likeSrtnCd=code, beginBasDt=_date(begin), endBasDt=_date(end))
 
 class FAQRAGService:
-    def __init__(self, api_key: str | None = None, chat_model: str = CHAT_MODEL):
+    def __init__(self, api_key: str | None = None, chat_model: str = CHAT_MODEL, min_relevance_score: float = RAG_MIN_RELEVANCE_SCORE):
         self.api_key, self.chat_model = api_key or _key("GEMINI_API_KEY"), chat_model
+        self.min_relevance_score = min_relevance_score
         self.vectorstore: FAISS | None = None
         self.document_name: str | None = None
         self.document_hash: str | None = None
@@ -231,90 +252,187 @@ class FAQRAGService:
                 index_dir.mkdir(parents=True, exist_ok=True)
                 index_bundle.write_bytes(self.vectorstore.serialize_to_bytes())
             self.document_name, self.document_hash = path.name, digest
+            try: cleanup_old_indexes(digest)
+            except OSError: pass
             return digest
         except (ConfigurationError, RAGError): raise
         except Exception as exc: raise _friendly_gemini_error(exc) from exc
 
     def retrieve(self, question: str, k: int = 4) -> list[Document]:
         if self.vectorstore is None: raise RAGError("서비스의 ETF FAQ 지식베이스를 사용할 수 없습니다. 운영자에게 문의해 주세요.")
-        try: return self.vectorstore.as_retriever(search_type="similarity", search_kwargs={"k":k}).invoke(question)
+        try:
+            concepts = [word for word in RAG_CONCEPT_WORDS if word.upper() in question.upper()]
+            matches = self.vectorstore.similarity_search_with_relevance_scores(question, k=k)
+            if len(concepts) > 1 and any(marker in question.lower() for marker in ("차이", "다르", "달라", "비교")):
+                for concept in concepts: matches += self.vectorstore.similarity_search_with_relevance_scores(concept, k=1)
+            unique: dict[tuple[Any, ...], tuple[Document, float]] = {}
+            for doc, score in matches:
+                if score < self.min_relevance_score: continue
+                key = (doc.metadata.get("file_name"), doc.metadata.get("page"), doc.page_content)
+                if key not in unique or score > unique[key][1]: unique[key] = (doc, score)
+            return [doc for doc, score in sorted(unique.values(), key=lambda item:item[1], reverse=True)]
         except Exception as exc: raise _friendly_gemini_error(exc) from exc
 
-    def answer(self, question: str) -> dict[str, Any]:
-        docs = self.retrieve(question)
+    def answer(self, question: str, conversation_context: dict[str, Any] | None = None) -> dict[str, Any]:
+        search_question = question + (" ETF NAV 괴리율 유동성공급자 LP" if conversation_context else "")
+        docs = self.retrieve(search_question)
         if not docs: return {"answer":"업로드된 한국거래소 ETF FAQ 문서에서는 해당 내용을 확인할 수 없습니다.", "sources":[]}
         context = "\n\n".join(f"[{d.metadata['file_name']} {d.metadata['page']+1}페이지]\n{d.page_content}" for d in docs)
-        system = "제공된 FAQ 문서 문맥만 근거로 답하세요. 문서에 없는 내용은 추측하지 말고 질문과 무관한 문맥으로 답하지 마세요. 수치, 날짜, 제도를 왜곡하지 마세요. 근거가 부족하면 '업로드된 한국거래소 ETF FAQ 문서에서는 해당 내용을 확인할 수 없습니다.'라고 답하세요. 한국어로 명확하고 간결하게 쓰고 투자 권유나 수익 보장 표현을 하지 마세요. 본문만 작성하세요."
+        previous = ""
+        if conversation_context:
+            previous = "\n\n직전 분석 정보:\n" + "\n".join(f"- {key}: {conversation_context.get(key)}" for key in ("itmsNm", "srtnCd", "basDt", "difference", "rate", "status") if conversation_context.get(key) is not None)
+        denial = "업로드된 한국거래소 ETF FAQ 문서에서는 해당 내용을 확인할 수 없습니다."
+        system = f"차분한 금융 데이터 분석가처럼 한국어 존댓말로 답하세요. 핵심을 먼저 말하고 전문용어는 짧게 풀어 2~4문장으로 설명하세요. 인사, 칭찬, 감탄사, 이모지, 과장된 친근함은 쓰지 마세요. 제공된 FAQ 문맥과 직전 분석 정보만 근거로 사용하고 수치, 날짜, 제도를 바꾸거나 새로운 수치를 만들지 마세요. 비교 질문은 서로 다른 문맥 조각의 근거를 종합해 차이를 설명하세요. 단일 기준일의 괴리율이 0에 가깝다는 이유만으로 가장 안정적인 ETF라고 단정하지 말고 기간별 괴리율, 유동성, 호가 스프레드와 추적오차를 함께 봐야 한다고 설명하세요. 근거가 부족하면 '{denial}'라고 답하세요. 투자 권유나 수익 보장 표현 없이 본문만 작성하세요."
         try:
             llm = ChatGoogleGenerativeAI(model=self.chat_model, temperature=0, google_api_key=self.api_key)
-            response = llm.invoke([SystemMessage(content=system), HumanMessage(content=f"문맥:\n{context}\n\n질문: {question}")])
+            response = llm.invoke([SystemMessage(content=system), HumanMessage(content=f"FAQ 문맥:\n{context}{previous}\n\n질문: {question}")])
             body = getattr(response, "text", None) or str(response.content)
         except Exception as exc: raise _friendly_gemini_error(exc) from exc
+        if denial in body: return {"answer":denial, "sources":[]}
         sources = sorted({f"{d.metadata['file_name']}, {d.metadata['page']+1}페이지" for d in docs})
         return {"answer":body.strip()+"\n\n출처:\n"+"\n".join(f"- {x}" for x in sources), "sources":sources}
 
 class QueryRouter:
-    api_words, rag_words = tuple(METRIC_WORDS), ("ETF란", "ETF가 무엇", "무엇인지", "장점", "차이", "거래 방법", "매매", "상장", "설정", "환매", "유동성공급자", "LP", "괴리율", "추적오차", "세금", "위험", "FAQ", "개념")
+    rag_words = RAG_CONCEPT_WORDS
+    unsupported_words = ("추천", "전망", "예측", "실시간", "뉴스", "세금", "과세", "수수료", "보수", "분배금", "배당", "거래량", "거래대금", "시가총액", "고가", "저가", "포트폴리오")
+    explanation_words = ("왜", "무엇", "뭐", "개념", "설명", "차이", "다르", "달라", "어떻게", "의미")
+    data_request_words = ("최신", "일별", "데이터", "조회", "보여줘", "계산", "분석")
+    follow_up_words = ("왜", "그럼", "그런", "이런", "이건", "무슨 뜻", "반대", "여기서", "이 수치", "언제 기준", "다시 설명", "거의", "안정", "볼 수") + BREVITY_WORDS
     def __init__(self, api_key: str | None = None): self.api_key = api_key or _key("GEMINI_API_KEY")
-    def classify(self, question: str) -> str:
-        upper = question.upper(); api = any(x.upper() in upper for x in self.api_words); rag = any(x.upper() in upper for x in self.rag_words)
-        if api and rag: return "HYBRID"
-        if api or re.search(r"\b\d{6}\b", question): return "API"
+    def classify(self, question: str, has_context: bool = False) -> str:
+        upper = question.upper()
+        if any(x.upper() in upper for x in self.unsupported_words): return "UNSUPPORTED"
+        normalized = normalize_etf_query(question)
+        api = bool(re.search(ETF_CODE_PATTERN, question, re.I) or re.search(rf"\b(?:{ETF_BRAND_PATTERN})\s+\S+", normalized, re.I))
+        rag = any(x.upper() in upper for x in self.rag_words)
+        explanation = any(word in question for word in self.explanation_words)
+        if api: return "HYBRID" if rag and explanation else "API"
+        if has_context and any(x.upper() in upper for x in self.follow_up_words): return "FOLLOW_UP"
+        if rag and not explanation and any(word in question for word in self.data_request_words): return "NEEDS_ETF"
         if rag: return "RAG"
-        if re.search(r"\b(?:KODEX|TIGER|ACE|KBSTAR|SOL)\s+\S+", normalize_etf_query(question), re.I): return "API"
-        if "ETF" in upper: return "GENERAL"
         return "UNSUPPORTED"
     def extract_entities(self, question: str) -> dict[str, Any]:
-        normalized = normalize_etf_query(question); match = re.search(r"(?<!\d)(\d{6})(?!\d)", normalized)
-        metric_text = normalized.upper()
-        metrics = []
-        # 긴 표현부터 소비해 '시가총액'을 '시가'로도 중복 인식하지 않는다.
-        for word, field in sorted(METRIC_WORDS.items(), key=lambda item: len(item[0]), reverse=True):
-            if word.upper() in metric_text:
-                metrics.append(field); metric_text = metric_text.replace(word.upper(), " ")
-        metrics = list(dict.fromkeys(metrics))
-        name_match = re.search(r"\b(KODEX|TIGER|ACE|KBSTAR|SOL)\s+([A-Za-z0-9가-힣&+._-]+)", normalized, re.I)
+        normalized = normalize_etf_query(question); match = re.search(ETF_CODE_PATTERN, normalized, re.I)
+        name_match = re.search(rf"\b({ETF_BRAND_PATTERN})\s+([A-Za-z0-9가-힣&+._-]+)", normalized, re.I)
         etf_name = f"{name_match.group(1).upper()} {name_match.group(2)}" if name_match else None
         rag_query = normalized
         if etf_name: rag_query = re.sub(re.escape(name_match.group(0)), " ", rag_query, count=1, flags=re.I)
-        for word in sorted(METRIC_WORDS, key=len, reverse=True): rag_query = re.sub(re.escape(word), " ", rag_query, flags=re.I)
+        for word in QUERY_FILLER_WORDS: rag_query = re.sub(re.escape(word), " ", rag_query, flags=re.I)
         rag_query = re.sub(r"\b(?:최근|알려줘|보여줘)\b|(?:와|과|랑|이랑)\s*$", " ", rag_query).strip(" ,·과와")
-        api_metric_names = {"clpr":"close_price", "nav":"nav", "mkp":"open_price", "hipr":"high_price", "lopr":"low_price", "trqu":"trading_volume", "trPrc":"trading_value", "mrktTotAmt":"market_cap", "nPptTotAmt":"net_asset_total", "fltRt":"change_rate", "bssIdxIdxNm":"base_index"}
-        final_metrics = metrics or ["clpr"]
-        return {"query":normalized, "etf_name":etf_name, "code":match.group(1) if match else None,
-                "metrics":final_metrics, "api_metrics":[api_metric_names.get(x, x) for x in final_metrics],
-                "rag_query":rag_query or normalized}
+        return {"query":normalized, "etf_name":etf_name, "code":match.group(1).upper() if match else None, "rag_query":rag_query or normalized}
 
 def _format_date(value: Any) -> str:
     try: return datetime.strptime(str(value), "%Y%m%d").strftime("%Y년 %m월 %d일")
     except ValueError: return str(value or "기준일 미상")
 
-def format_api_answer(row: dict[str, Any], metrics: list[str]) -> str:
-    lines = [f"{_format_date(row.get('basDt'))} 기준 {row.get('itmsNm')}({row.get('srtnCd')}) 데이터입니다."]
-    for field in metrics:
-        value, label = row.get(field), FIELD_LABELS.get(field, field)
-        if value is None: lines.append(f"- {label}: 제공되지 않음")
-        elif field == "fltRt": lines.append(f"- {label}: {value:,.2f}%")
-        elif isinstance(value, (int,float)): lines.append(f"- {label}: {value:,}")
-        else: lines.append(f"- {label}: {value}")
-    return "\n".join(lines+["", f"출처: {ETF_API_SOURCE}", "※ 실시간 시세가 아닌 일 단위 데이터입니다."])
+def calculate_divergence(row: dict[str, Any]) -> dict[str, Any]:
+    """공식 종가와 NAV로 괴리율을 결정론적으로 계산한다."""
+    close, nav = _number(row.get("clpr")), _number(row.get("nav"))
+    result = {"calculable":False, "close":close, "nav":nav, "difference":None, "rate":None, "status":None, "reason":None}
+    if close is None:
+        result["reason"] = "종가가 제공되지 않아 괴리율을 계산할 수 없습니다."
+        return result
+    if nav is None:
+        result["reason"] = "NAV가 제공되지 않아 괴리율을 계산할 수 없습니다."
+        return result
+    if nav <= 0:
+        result["reason"] = "NAV가 0 이하이므로 괴리율을 계산할 수 없습니다."
+        return result
+    difference, rate = close - nav, (close - nav) / nav * 100
+    status = "할증" if difference > 0 else "할인" if difference < 0 else "일치"
+    result.update(calculable=True, difference=difference, rate=rate, status=status)
+    return result
 
-def answer_user_query(question: str, api_client: ETFAPIClient, rag_service: FAQRAGService | None = None) -> dict[str, Any]:
-    router = QueryRouter(); intent = router.classify(question); entities = router.extract_entities(question)
-    result = {"intent":intent, "answer":"", "sources":[], "candidates":[], "data":None}
+def _format_number(value: int | float | None, signed: bool = False) -> str:
+    if value is None: return "제공되지 않음"
+    if isinstance(value, float) and not value.is_integer(): return f"{value:+,.2f}" if signed else f"{value:,.2f}"
+    return f"{int(value):+,}" if signed else f"{int(value):,}"
+
+def format_etf_analysis(row: dict[str, Any], analysis: dict[str, Any], today: date | None = None) -> str:
+    lines = [f"{row.get('itmsNm')}({row.get('srtnCd')})을 최근 공식 데이터 기준으로 확인했습니다.", "", "[분석 결과]",
+             f"- 기준일: {_format_date(row.get('basDt'))}", f"- 종가: {_format_number(analysis['close'])}", f"- NAV: {_format_number(analysis['nav'])}"]
+    if analysis["calculable"]:
+        status_text = {"할증":"종가가 NAV보다 높은 할증 상태입니다.", "할인":"종가가 NAV보다 낮은 할인 상태입니다.", "일치":"종가와 NAV가 같습니다."}[analysis["status"]]
+        lines += [f"- 가격 차이(종가 - NAV): {_format_number(analysis['difference'], signed=True)}",
+                  f"- 괴리율: {analysis['rate']:+.2f}%",
+                  f"- 상태: {status_text}"]
+    else:
+        lines.append(f"- 괴리율: 계산 불가 ({analysis['reason']})")
+    notices = ["※ 실시간 시세가 아닌 일 단위 데이터이며, 할증·할인은 투자 판단 신호가 아닙니다."]
+    try: age = ((today or date.today()) - datetime.strptime(str(row.get("basDt")), "%Y%m%d").date()).days
+    except ValueError: age = None
+    if age is not None and age > 3: notices.append(f"※ API가 제공한 최신 기준일이 오늘보다 {age}일 전입니다. 최근 거래일 데이터가 아직 반영되지 않았을 수 있습니다.")
+    return "\n".join(lines+["", "계산식: (종가 - NAV) / NAV × 100", f"출처: {ETF_API_SOURCE}", *notices])
+
+def _analysis_context(row: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
+    return {"itmsNm":row.get("itmsNm"), "srtnCd":row.get("srtnCd"), "basDt":row.get("basDt"), "difference":analysis.get("difference"), "rate":analysis.get("rate"), "status":analysis.get("status")}
+
+def _fallback_interpretation(analysis: dict[str, Any]) -> str:
+    if not analysis["calculable"]: return analysis["reason"]
+    meanings = {"할증":"종가가 NAV보다 높은 가격에 형성된 상태입니다.", "할인":"종가가 NAV보다 낮은 가격에 형성된 상태입니다.", "일치":"종가와 NAV가 같은 수준입니다."}
+    return meanings[analysis["status"]] + " 시장 수요와 LP의 호가 공급 등에 따라 차이가 생길 수 있으며, 이 결과만으로 매수 여부를 판단할 수는 없습니다."
+
+def _unsupported_answer(question: str) -> str:
+    if "실시간" in question: return "실시간 시세는 확인할 수 없습니다. ETF 이름이나 종목코드를 입력하면 현재 제공되는 최신 일별 데이터로 괴리율을 분석해드릴 수 있습니다."
+    if any(word in question for word in ("추천", "전망", "예측", "포트폴리오")): return "종목 추천이나 가격 예측은 제공하지 않습니다. 대신 확인하려는 ETF의 이름이나 종목코드를 입력하면 종가와 NAV의 차이를 공식 데이터로 살펴볼 수 있습니다."
+    if any(word in question for word in ("세금", "과세", "수수료", "보수", "분배금", "배당")): return "세금·비용·분배금은 현재 분석 범위에 포함되지 않습니다. 이 서비스에서는 국내 ETF의 괴리율·NAV와 관련 개념을 확인할 수 있습니다."
+    return "이 서비스는 공식 일별 데이터로 국내 ETF의 괴리율·NAV를 분석하고 관련 개념을 설명합니다. 분석할 ETF 이름이나 6자리 종목코드를 입력해 주세요."
+
+def _follow_up_fallback(question: str, context: dict[str, Any]) -> str:
+    if any(word in question for word in BREVITY_WORDS):
+        rate = context.get("rate")
+        rate_text = f"{rate:+.2f}%" if isinstance(rate, (int, float)) else "0에 가까운 괴리율"
+        return f"쉽게 말하면, 괴리율 {rate_text}는 그날 ETF 가격과 NAV가 거의 같았다는 뜻입니다. 다만 이것만으로 지금 사도 안전하다고 볼 수는 없습니다."
+    if "언제 기준" in question:
+        return f"직전 분석은 {_format_date(context.get('basDt'))} 기준 {context.get('itmsNm')} 데이터입니다. API의 최신 반영일이 실제 최근 거래일보다 늦을 수 있으므로 기준일을 함께 확인해야 합니다."
+    if any(word in question for word in ("거의", "안정", "볼 수", "0")):
+        rate = context.get("rate")
+        rate_text = f"{rate:+.2f}%" if isinstance(rate, (int, float)) else "0에 가까운 괴리율"
+        return f"괴리율 {rate_text}은 해당 기준일에 시장가격과 NAV가 가까웠다는 뜻입니다. 다만 하루 수치만으로 가장 안정적인 상태라고 판단할 수는 없습니다. 기간별 괴리율 흐름과 유동성, 호가 스프레드, 추적오차를 함께 살펴봐야 합니다."
+    status = context.get("status")
+    return f"직전 결과는 {context.get('itmsNm')}의 {status or '괴리율'} 상태를 보여줍니다. 시장 수요와 LP의 호가 공급 등에 따라 시장가격과 NAV의 차이가 생길 수 있으며, 한 시점의 결과만으로 상품의 안정성을 단정할 수는 없습니다."
+
+def answer_user_query(question: str, api_client: ETFAPIClient, rag_service: FAQRAGService | None = None, selected_code: str | None = None, previous_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    router = QueryRouter(); intent = router.classify(question, has_context=bool(previous_context)); entities = router.extract_entities(question)
+    result = {"intent":intent, "answer":"", "sources":[], "candidates":[], "data":None, "analysis":None, "conversation_context":previous_context if intent == "FOLLOW_UP" else None}
     if intent in {"API", "HYBRID"}:
-        candidates = api_client.search_etfs(entities["code"] or entities["etf_name"] or entities["query"])
-        if not candidates: raise ETFAPINoDataError("조건에 맞는 ETF 데이터를 찾지 못했습니다.")
-        if len(candidates)>1: result["candidates"] = candidates; return result
-        row = api_client.get_latest_etf(str(candidates[0]["srtnCd"])); result["data"] = row
-        result["answer"], result["sources"] = format_api_answer(row, entities["metrics"]), [ETF_API_SOURCE]
-    if intent in {"RAG", "GENERAL", "HYBRID"}:
-        if rag_service is None or rag_service.vectorstore is None:
-            notice = "서비스의 ETF FAQ 지식베이스를 사용할 수 없습니다. 운영자에게 문의해 주세요."
-            result["answer"] = (result["answer"]+"\n\n[ETF 개념]\n"+notice).strip() if intent == "HYBRID" else notice
+        if selected_code:
+            row = api_client.get_latest_etf(selected_code)
         else:
-            rag = rag_service.answer(entities["rag_query"] if intent == "HYBRID" else question)
-            result["answer"] = ("[시세 정보]\n"+result["answer"]+"\n\n[ETF 개념]\n"+rag["answer"]) if intent == "HYBRID" else rag["answer"]
+            candidates = api_client.search_etfs(entities["code"] or entities["etf_name"] or entities["query"])
+            if not candidates: raise ETFAPINoDataError("조건에 맞는 ETF 데이터를 찾지 못했습니다.")
+            if len(candidates)>1: result["candidates"] = candidates; return result
+            row = api_client.get_latest_etf(str(candidates[0]["srtnCd"]))
+        result["data"] = row
+        result["analysis"] = calculate_divergence(row)
+        result["conversation_context"] = _analysis_context(row, result["analysis"])
+        result["answer"], result["sources"] = format_etf_analysis(row, result["analysis"]), [ETF_API_SOURCE]
+        if intent == "API":
+            interpretation = _fallback_interpretation(result["analysis"])
+            if rag_service is not None and rag_service.vectorstore is not None:
+                try:
+                    rag = rag_service.answer("직전 ETF 분석 결과의 의미와 괴리율이 생길 수 있는 이유를 설명해 주세요.", result["conversation_context"])
+                    if rag["sources"]: interpretation = rag["answer"]; result["sources"] += rag["sources"]
+                except RAGError: pass
+            result["answer"] += "\n\n[해석]\n" + interpretation
+    if intent in {"RAG", "HYBRID", "FOLLOW_UP"}:
+        if intent == "FOLLOW_UP":
+            fallback = _follow_up_fallback(question, previous_context or {})
+            if any(word in question for word in BREVITY_WORDS) or rag_service is None or rag_service.vectorstore is None:
+                result["answer"] = fallback
+            else:
+                try:
+                    rag = rag_service.answer(question, result["conversation_context"])
+                    result["answer"] = rag["answer"] if rag["sources"] else fallback
+                    result["sources"] += rag["sources"]
+                except RAGError: result["answer"] = fallback
+        elif rag_service is None or rag_service.vectorstore is None:
+            notice = "FAQ 설명 기능을 현재 사용할 수 없습니다. 공식 데이터 분석 결과는 계속 확인할 수 있습니다."
+            result["answer"] = (result["answer"]+"\n\n[관련 개념]\n"+notice) if intent == "HYBRID" else notice
+        else:
+            rag = rag_service.answer(entities["rag_query"] if intent == "HYBRID" else question, result["conversation_context"] if intent == "FOLLOW_UP" else None)
+            result["answer"] = (result["answer"]+"\n\n[관련 개념]\n"+rag["answer"]) if intent == "HYBRID" else rag["answer"]
             result["sources"] += rag["sources"]
-    if intent == "UNSUPPORTED": result["answer"] = "현재 챗봇은 한국거래소 ETF FAQ 문서와 금융위원회 ETF 시세 데이터 범위에서 답변합니다."
+    if intent == "NEEDS_ETF": result["answer"] = "어떤 ETF의 괴리율을 확인할까요? ETF 이름이나 6자리 종목코드를 입력해 주세요. 예: KODEX 200 또는 069500"
+    if intent == "UNSUPPORTED": result["answer"] = _unsupported_answer(question)
     return result
